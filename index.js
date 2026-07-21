@@ -1,706 +1,440 @@
-const express = require('express');
-const multer = require('multer');
-const ffmpeg = require('fluent-ffmpeg');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const EventEmitter = require('events');
-const axios = require('axios');
-const FormData = require('form-data');
+const express = require("express");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const AWS = require("aws-sdk");
+const crypto = require("crypto");
 
-// Initialize app first
 const app = express();
 
-// Extend EventEmitter for progress tracking
-class ProgressEmitter extends EventEmitter {}
-const progressEmitter = new ProgressEmitter();
+// Environment variables
+const ENV = {
+  R2_ENDPOINT: "https://8d6d71696c62d814030a8b94486298a6.r2.cloudflarestorage.com",
+  R2_ACCESS_KEY_ID: "a708c3b8ea970da1adb0cc4cb3822a74",
+  R2_SECRET_ACCESS_KEY: "b9e9376fc15ffb2c6a16c1fee5e61a6b100abee555b79c18bde0a2d8db1cace0",
+  R2_BUCKET_NAME: "timeline",
+  R2_ACCOUNT_ID: "9074667375914ae7aa1345f9e0d9a0a5",
+  PORT: 3000,
+  MAX_FILE_SIZE: 100 * 1024 * 1024 // 100MB for videos
+};
 
-// Store progress data
-const progressStore = new Map();
+// Clean up endpoint URL
+const endpoint = ENV.R2_ENDPOINT.replace(/\/$/, '');
 
-// Cloudflare R2 configuration
-const R2_UPLOAD_URL = 'https://r2-cloudflare.onrender.com/upload';
+// Configure Cloudflare R2
+const s3 = new AWS.S3({
+  endpoint: endpoint,
+  accessKeyId: ENV.R2_ACCESS_KEY_ID.trim(),
+  secretAccessKey: ENV.R2_SECRET_ACCESS_KEY.trim(),
+  region: "auto",
+  signatureVersion: "v4",
+  s3ForcePathStyle: true,
+  maxRetries: 3,
+  retryDelayOptions: { base: 300 },
+});
 
-// Try to use ffmpeg-installer, fallback to system ffmpeg
-try {
-  const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
-  ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-  console.log('Using FFmpeg from:', ffmpegInstaller.path);
-} catch (error) {
-  console.log('ffmpeg-installer not found, using system FFmpeg');
-  try {
-    const which = require('which');
-    const ffmpegPath = which.sync('ffmpeg');
-    ffmpeg.setFfmpegPath(ffmpegPath);
-    console.log('Found system FFmpeg at:', ffmpegPath);
-  } catch (e) {
-    console.error('FFmpeg not found. Please install FFmpeg');
-    process.exit(1);
-  }
-}
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Ensure uploads directory exists
-if (!fs.existsSync('uploads')) {
-  fs.mkdirSync('uploads');
+const uploadDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-// Check available disk space
-const checkDiskSpace = () => {
-  try {
-    const stats = fs.statSync('/');
-    const freeSpace = stats.bfree * stats.bsize;
-    const freeSpaceGB = freeSpace / (1024 * 1024 * 1024);
-    console.log(`Available disk space: ${freeSpaceGB.toFixed(2)} GB`);
-    return freeSpaceGB;
-  } catch (error) {
-    console.warn('Could not check disk space:', error.message);
-    return 20; // Assume 20GB available
-  }
+// MIME types mapping
+const getContentType = (filename) => {
+  const ext = path.extname(filename).toLowerCase();
+  const mimeTypes = {
+    // Images
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".ico": "image/x-icon",
+    ".avif": "image/avif",
+    
+    // Videos
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".flv": "video/x-flv",
+    ".wmv": "video/x-ms-wmv",
+    ".m4v": "video/x-m4v",
+    ".3gp": "video/3gpp",
+    ".ogv": "video/ogg",
+    ".mpeg": "video/mpeg",
+    
+    // Audio
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    
+    // Documents
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".json": "application/json",
+    ".html": "text/html",
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".zip": "application/zip",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  };
+  return mimeTypes[ext] || "application/octet-stream";
 };
 
-// Configure multer storage
+// Get media type for categorization
+const getMediaType = (filename) => {
+  const ext = path.extname(filename).toLowerCase();
+  const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.tiff', '.ico', '.avif'];
+  const videoExts = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.3gp', '.ogv', '.mpeg'];
+  const audioExts = ['.mp3', '.wav', '.ogg', '.aac', '.flac', '.m4a'];
+  
+  if (imageExts.includes(ext)) return 'image';
+  if (videoExts.includes(ext)) return 'video';
+  if (audioExts.includes(ext)) return 'audio';
+  return 'other';
+};
+
+// Generate public URL for the file
+const getPublicUrl = (fileName) => {
+  return `https://pub-${ENV.R2_ACCOUNT_ID}.r2.dev/${fileName}`;
+};
+
+// Upload function with user metadata
+async function uploadToR2(filePath, fileName, metadata = {}) {
+  try {
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File does not exist: ${filePath}`);
+    }
+    
+    const fileContent = fs.readFileSync(filePath);
+    const contentType = getContentType(fileName);
+    const mediaType = getMediaType(fileName);
+    
+    // Generate a unique hash for the file
+    const fileHash = crypto.createHash('md5').update(fileContent).digest('hex');
+    
+    // Sanitize filename to ensure uniqueness
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.]/g, "_");
+    const uniqueKey = `${Date.now()}-${sanitizedFileName}`;
+    
+    // Extract user metadata
+    const userUid = metadata.userUid || 'anonymous';
+    const followersDocId = metadata.followersDocId || 'unknown';
+    
+    const params = {
+      Bucket: ENV.R2_BUCKET_NAME.trim(),
+      Key: uniqueKey,
+      Body: fileContent,
+      ContentType: contentType,
+      Metadata: {
+        'uploaded-at': new Date().toISOString(),
+        'original-name': fileName,
+        'file-hash': fileHash,
+        'media-type': mediaType,
+        'file-size': fileContent.length.toString(),
+        'user-uid': userUid,
+        'followers-doc-id': followersDocId,
+        // Include all other metadata
+        ...Object.keys(metadata).reduce((acc, key) => {
+          if (!['userUid', 'followersDocId'].includes(key)) {
+            acc[key] = String(metadata[key]);
+          }
+          return acc;
+        }, {})
+      }
+    };
+
+    const upload = s3.upload(params);
+    
+    await upload.promise();
+    const publicUrl = getPublicUrl(uniqueKey);
+    
+    // Clean up local file
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch (unlinkError) {
+      // Silently handle cleanup errors
+    }
+    
+    return {
+      publicUrl: publicUrl,
+      mediaType: mediaType,
+      fileName: uniqueKey,
+      originalName: fileName,
+      contentType: contentType,
+      fileSize: fileContent.length,
+      userMetadata: {
+        userUid: userUid,
+        followersDocId: followersDocId
+      }
+    };
+  } catch (error) {
+    // Clean up on error
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch (unlinkError) {
+      // Silently handle cleanup errors
+    }
+    throw error;
+  }
+}
+
+// Multer configuration
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, 'uploads/');
+    cb(null, uploadDir);
   },
   filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + '-' + file.originalname);
-  }
+    const sanitized = file.originalname.replace(/[^a-zA-Z0-9.]/g, "_");
+    cb(null, Date.now() + "-" + sanitized);
+  },
 });
 
-// Configure multer with 5GB limit
-const upload = multer({
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = [
+    // Images
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml',
+    'image/bmp', 'image/tiff', 'image/x-icon', 'image/avif',
+    // Videos
+    'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
+    'video/webm', 'video/x-flv', 'video/x-ms-wmv', 'video/x-m4v',
+    'video/3gpp', 'video/ogg', 'video/mpeg',
+    // Audio
+    'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/aac', 'audio/flac',
+    // Documents
+    'application/pdf'
+  ];
+  
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Unsupported file type: ' + file.mimetype + '. Supported: images, videos, audio, and PDFs.'), false);
+  }
+};
+
+const upload = multer({ 
   storage: storage,
   limits: {
-    fileSize: 5 * 1024 * 1024 * 1024, // 5GB
-    fieldSize: 5 * 1024 * 1024 * 1024,
-    fields: 10,
-    files: 1
-  }
+    fileSize: ENV.MAX_FILE_SIZE
+  },
+  fileFilter: fileFilter
 });
 
-// Function to upload file to Cloudflare R2 with detailed logging
-const uploadToR2 = async (filePath, fileName, metadata = {}) => {
+// Single file upload endpoint with user metadata
+app.post("/upload", upload.single("file"), async (req, res) => {
   try {
-    console.log('\n📤 ========== STARTING R2 UPLOAD ==========');
-    console.log('📁 File path:', filePath);
-    console.log('📄 File name:', fileName);
-    console.log('📋 Metadata:', metadata);
-    
-    // Check if file exists
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`File not found: ${filePath}`);
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
     }
-    
-    const fileStats = fs.statSync(filePath);
-    const fileSizeMB = (fileStats.size / (1024 * 1024)).toFixed(2);
-    const fileSizeGB = (fileStats.size / (1024 * 1024 * 1024)).toFixed(2);
-    console.log(`📊 File size: ${fileSizeMB} MB (${fileSizeGB} GB)`);
-    
-    const formData = new FormData();
-    formData.append('file', fs.createReadStream(filePath), fileName);
-    
-    // Add metadata to the upload request
-    if (metadata) {
-      Object.keys(metadata).forEach(key => {
-        formData.append(key, metadata[key]);
-      });
-    }
-    
-    console.log('🌐 Sending request to:', R2_UPLOAD_URL);
-    console.log('⏳ Uploading... (this may take a while for large files)');
-    
-    const startTime = Date.now();
-    
-    const response = await axios.post(R2_UPLOAD_URL, formData, {
-      headers: {
-        ...formData.getHeaders(),
-      },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      timeout: 600000, // 10 minutes timeout for large files
-      onUploadProgress: (progressEvent) => {
-        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-        if (percentCompleted % 10 === 0) {
-          console.log(`📊 Upload progress: ${percentCompleted}%`);
-        }
-      }
-    });
-    
-    const endTime = Date.now();
-    const uploadTime = ((endTime - startTime) / 1000).toFixed(2);
-    
-    console.log('✅ Upload completed in', uploadTime, 'seconds');
-    console.log('📦 Response status:', response.status);
-    console.log('📦 Response data:', JSON.stringify(response.data, null, 2));
-    
-    // Detailed response logging
-    if (response.data) {
-      console.log('\n📋 ========== R2 UPLOAD RESPONSE DETAILS ==========');
-      console.log('✅ Success:', response.data.success);
-      console.log('📝 Message:', response.data.message);
-      console.log('🔗 Public URL:', response.data.publicUrl);
-      console.log('📁 Media Type:', response.data.mediaType);
-      console.log('📄 File Name:', response.data.fileName || fileName);
-      
-      // Log additional fields if present
-      if (response.data.bucket) console.log('🪣 Bucket:', response.data.bucket);
-      if (response.data.key) console.log('🔑 Key:', response.data.key);
-      if (response.data.etag) console.log('🏷️ ETag:', response.data.etag);
-      if (response.data.size) console.log('📊 Uploaded Size:', response.data.size);
-      
-      console.log('=================================================\n');
-    }
-    
-    return response.data;
-  } catch (error) {
-    console.error('\n❌ ========== R2 UPLOAD FAILED ==========');
-    console.error('Error message:', error.message);
-    
-    if (error.response) {
-      console.error('Response status:', error.response.status);
-      console.error('Response data:', JSON.stringify(error.response.data, null, 2));
-    }
-    
-    if (error.request) {
-      console.error('No response received from server');
-    }
-    
-    console.error('==========================================\n');
-    throw new Error(`R2 upload failed: ${error.message}`);
-  }
-};
-
-// Cleanup function for old files
-const cleanupOldFiles = (directory, maxAgeHours = 24) => {
-  const now = Date.now();
-  const maxAge = maxAgeHours * 60 * 60 * 1000;
-  
-  fs.readdir(directory, (err, files) => {
-    if (err) return;
-    
-    files.forEach(file => {
-      const filePath = path.join(directory, file);
-      fs.stat(filePath, (err, stats) => {
-        if (err) return;
-        const fileAge = now - stats.mtime.getTime();
-        if (fileAge > maxAge) {
-          fs.unlink(filePath, () => {});
-          console.log('Cleaned up old file:', file);
-        }
-      });
-    });
-  });
-};
-
-// Run cleanup every hour
-setInterval(() => {
-  cleanupOldFiles('uploads', 24);
-}, 60 * 60 * 1000);
-
-// Get video duration using ffprobe
-const getVideoDuration = (inputPath) => {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(inputPath, (err, metadata) => {
-      if (err) {
-        reject(err);
-      } else {
-        const duration = metadata.format.duration || 0;
-        resolve(duration);
-      }
-    });
-  });
-};
-
-// Get video metadata including duration and media type
-const getVideoMetadata = (inputPath) => {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(inputPath, (err, metadata) => {
-      if (err) {
-        reject(err);
-      } else {
-        const duration = metadata.format.duration || 0;
-        const format = metadata.format.format_name || 'unknown';
-        const bitrate = metadata.format.bit_rate || 0;
-        const streams = metadata.streams || [];
-        
-        // Find video and audio streams
-        const videoStream = streams.find(s => s.codec_type === 'video');
-        const audioStream = streams.find(s => s.codec_type === 'audio');
-        
-        // Determine media type
-        let mediaType = 'video';
-        if (videoStream) {
-          mediaType = 'video';
-        } else if (audioStream) {
-          mediaType = 'audio';
-        } else {
-          mediaType = 'unknown';
-        }
-        
-        resolve({
-          duration: duration,
-          mediaType: mediaType,
-          format: format,
-          bitrate: bitrate,
-          videoStream: videoStream ? {
-            codec: videoStream.codec_name || 'unknown',
-            width: videoStream.width || 0,
-            height: videoStream.height || 0,
-            frameRate: videoStream.r_frame_rate || '0/0'
-          } : null,
-          audioStream: audioStream ? {
-            codec: audioStream.codec_name || 'unknown',
-            channels: audioStream.channels || 0,
-            sampleRate: audioStream.sample_rate || 0
-          } : null
-        });
-      }
-    });
-  });
-};
-
-// Enhanced compression with R2 upload
-const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalFileName, userMetadata = {}) => {
-  console.log('\n=== Starting Compression and Upload ===');
-  console.log('Input:', inputPath);
-  console.log('Output:', outputPath);
-  console.log('User Metadata:', userMetadata);
-  
-  // Get input file size
-  let inputSize = 0;
-  try {
-    const stats = fs.statSync(inputPath);
-    inputSize = stats.size;
-    const sizeGB = (inputSize / (1024 * 1024 * 1024)).toFixed(2);
-    const sizeMB = (inputSize / (1024 * 1024)).toFixed(2);
-    console.log(`Input file size: ${sizeMB} MB (${sizeGB} GB)`);
-    
-    // Check if we have enough disk space
-    const freeSpace = checkDiskSpace();
-    const neededSpace = (inputSize * 2) / (1024 * 1024 * 1024);
-    if (freeSpace < neededSpace) {
-      return res.status(507).json({
-        error: 'Insufficient disk space',
-        message: `Need at least ${neededSpace.toFixed(2)}GB free, have ${freeSpace.toFixed(2)}GB`
-      });
-    }
-  } catch (error) {
-    console.warn('Could not read input file size:', error.message);
-  }
-
-  // Get video metadata (duration and media type)
-  let videoMetadata = null;
-  try {
-    videoMetadata = await getVideoMetadata(inputPath);
-    console.log(`Video duration: ${videoMetadata.duration.toFixed(2)} seconds`);
-    console.log(`Media type: ${videoMetadata.mediaType}`);
-    console.log(`Format: ${videoMetadata.format}`);
-  } catch (error) {
-    console.warn('Could not get video metadata:', error.message);
-  }
-
-  // Adjust compression settings based on file size
-  const isLargeFile = inputSize > 1 * 1024 * 1024 * 1024; // > 1GB
-  const jobId = Date.now().toString();
-  
-  // Store initial progress with metadata
-  progressStore.set(jobId, {
-    percent: 0,
-    time: '00:00:00',
-    status: 'processing',
-    phase: 'compression',
-    duration: videoMetadata ? videoMetadata.duration : 0,
-    mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-    userMetadata: userMetadata
-  });
-
-  // Create a more aggressive compression for very large files
-  let videoBitrate = '1500k';
-  let audioBitrate = '128k';
-  let scale = 'iw*0.5:ih*0.5';
-  
-  if (inputSize > 4 * 1024 * 1024 * 1024) { // > 4GB
-    videoBitrate = '1000k';
-    scale = 'iw*0.3:ih*0.3';
-    console.log('Using extra aggressive compression for very large file');
-  } else if (inputSize > 2 * 1024 * 1024 * 1024) { // > 2GB
-    videoBitrate = '1200k';
-    scale = 'iw*0.4:ih*0.4';
-    console.log('Using aggressive compression for large file');
-  }
-
-  ffmpeg(inputPath)
-    .output(outputPath)
-    .videoCodec('libx264')
-    .audioCodec('aac')
-    .outputOptions([
-      '-movflags +faststart',
-      isLargeFile ? '-preset ultrafast' : '-preset medium',
-      '-crf 28',
-      `-vf scale=${scale}`,
-      `-b:v ${videoBitrate}`,
-      '-maxrate 2000k',
-      '-bufsize 4000k',
-      `-b:a ${audioBitrate}`,
-      '-ac 2',
-      '-threads ' + os.cpus().length
-    ])
-    .on('start', (commandLine) => {
-      console.log('FFmpeg command:', commandLine);
-      console.log(`Using ${os.cpus().length} CPU cores`);
-    })
-    .on('progress', (progress) => {
-      // Calculate progress more accurately
-      let percent = 0;
-      const videoDuration = videoMetadata ? videoMetadata.duration : 0;
-      if (videoDuration > 0) {
-        const parts = progress.timemark.split(':').map(Number);
-        const currentSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
-        percent = Math.min(100, (currentSeconds / videoDuration) * 100);
-      } else {
-        percent = Math.round(progress.percent || 0);
-      }
-      
-      const currentTime = progress.timemark || '00:00:00';
-      console.log(`Compression Progress: ${percent.toFixed(1)}% done (${currentTime})`);
-      
-      // Store progress data
-      progressStore.set(jobId, {
-        percent: percent,
-        time: currentTime,
-        status: 'processing',
-        phase: 'compression',
-        duration: videoMetadata ? videoMetadata.duration : 0,
-        mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-        userMetadata: userMetadata
-      });
-      
-      // Emit progress event
-      progressEmitter.emit('progress', jobId, percent, currentTime);
-    })
-    .on('end', async () => {
-      console.log('✅ Compression completed!');
-      
-      // Update progress for upload phase
-      progressStore.set(jobId, {
-        percent: 100,
-        time: '00:00:00',
-        status: 'processing',
-        phase: 'uploading',
-        duration: videoMetadata ? videoMetadata.duration : 0,
-        mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-        userMetadata: userMetadata
-      });
-      
-      try {
-        // Get compressed file info
-        const stats = fs.statSync(outputPath);
-        const compressedSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-        const compressedSizeGB = (stats.size / (1024 * 1024 * 1024)).toFixed(2);
-        const compressionRatio = ((stats.size / inputSize) * 100).toFixed(2);
-        
-        console.log(`Compressed size: ${compressedSizeMB} MB (${compressedSizeGB} GB)`);
-        console.log(`Compression ratio: ${compressionRatio}% of original`);
-        
-        // Prepare metadata for upload
-        const uploadMetadata = {
-          followersDocId: userMetadata.followersDocId || '',
-          userUid: userMetadata.userUid || '',
-          duration: videoMetadata ? videoMetadata.duration.toString() : '0',
-          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-          originalFileName: originalFileName,
-          compressedSize: compressedSizeMB,
-          compressionRatio: compressionRatio
-        };
-        
-        // Upload to Cloudflare R2 with metadata
-        const fileName = `compressed_${Date.now()}_${path.basename(originalFileName)}`;
-        const uploadResult = await uploadToR2(outputPath, fileName, uploadMetadata);
-        
-        // Log the full upload result
-        console.log('\n📦 ========== FULL UPLOAD RESULT ==========');
-        console.log(JSON.stringify(uploadResult, null, 2));
-        console.log('==========================================\n');
-        
-        // Log specific fields
-        if (uploadResult.publicUrl) {
-          console.log('🔗 PUBLIC URL:', uploadResult.publicUrl);
-        }
-        if (uploadResult.mediaType) {
-          console.log('📁 MEDIA TYPE:', uploadResult.mediaType);
-        }
-        
-        // Update progress - completed
-        progressStore.set(jobId, {
-          percent: 100,
-          time: '00:00:00',
-          status: 'completed',
-          phase: 'completed',
-          duration: videoMetadata ? videoMetadata.duration : 0,
-          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-          userMetadata: userMetadata
-        });
-        
-        // Clean up local files
-        try {
-          fs.unlinkSync(inputPath);
-          fs.unlinkSync(outputPath);
-          console.log('Local files cleaned up');
-        } catch (err) {
-          console.error('Error deleting local files:', err);
-        }
-        
-        // Send success response with R2 file info and all metadata
-        const responseData = {
-          success: true,
-          message: 'Video compressed and uploaded successfully!',
-          jobId: jobId,
-          compression: {
-            originalSize: `${(inputSize / (1024 * 1024 * 1024)).toFixed(2)} GB`,
-            compressedSize: `${compressedSizeMB} MB (${compressedSizeGB} GB)`,
-            compressionRatio: `${compressionRatio}%`
-          },
-          upload: {
-            status: 'success',
-            fileName: fileName,
-            r2Response: uploadResult
-          },
-          metadata: {
-            duration: videoMetadata ? videoMetadata.duration : 0,
-            mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-            format: videoMetadata ? videoMetadata.format : 'unknown',
-            followersDocId: userMetadata.followersDocId || '',
-            userUid: userMetadata.userUid || '',
-            originalFileName: originalFileName
-          }
-        };
-        
-        console.log('\n📤 ========== SENDING RESPONSE ==========');
-        console.log(JSON.stringify(responseData, null, 2));
-        console.log('======================================\n');
-        
-        res.json(responseData);
-        
-      } catch (error) {
-        console.error('❌ Upload failed:', error);
-        
-        progressStore.set(jobId, {
-          percent: 0,
-          time: '00:00:00',
-          status: 'failed',
-          phase: 'upload_failed',
-          duration: videoMetadata ? videoMetadata.duration : 0,
-          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-          userMetadata: userMetadata
-        });
-        
-        // Clean up files
-        try {
-          if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        } catch (e) {}
-        try {
-          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-        } catch (e) {}
-        
-        res.status(500).json({
-          error: 'Upload to R2 failed',
-          message: error.message,
-          jobId: jobId,
-          metadata: {
-            duration: videoMetadata ? videoMetadata.duration : 0,
-            mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-            followersDocId: userMetadata.followersDocId || '',
-            userUid: userMetadata.userUid || ''
-          }
-        });
-      }
-    })
-    .on('error', (err) => {
-      console.error('❌ Compression failed:', err);
-      
-      // Update progress
-      progressStore.set(jobId, {
-        percent: 0,
-        time: '00:00:00',
-        status: 'failed',
-        phase: 'compression_failed',
-        duration: videoMetadata ? videoMetadata.duration : 0,
-        mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-        userMetadata: userMetadata
-      });
-      
-      // Clean up files
-      try {
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      } catch (e) {}
-      try {
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-      } catch (e) {}
-      
-      res.status(500).json({
-        error: 'Compression failed',
-        message: err.message,
-        jobId: jobId,
-        metadata: {
-          duration: videoMetadata ? videoMetadata.duration : 0,
-          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
-          followersDocId: userMetadata.followersDocId || '',
-          userUid: userMetadata.userUid || ''
-        }
-      });
-    })
-    .run();
-};
-
-// ============== ROUTES ==============
-
-// Progress endpoint
-app.get('/progress/:jobId', (req, res) => {
-  const jobId = req.params.jobId;
-  const progress = progressStore.get(jobId);
-  
-  if (!progress) {
-    return res.status(404).json({
-      error: 'Job not found',
-      message: 'No compression job found with this ID'
-    });
-  }
-  
-  res.json({
-    jobId: jobId,
-    progress: progress
-  });
-});
-
-// Upload endpoint with compression and R2 upload
-app.post('/upload', (req, res) => {
-  console.log('\n=== New Upload Request ===');
-  console.log('Request headers:', req.headers);
-  console.log('Request body fields:', req.body);
-  
-  upload.any()(req, res, (err) => {
-    if (err) {
-      console.error('Upload error:', err);
-      
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({
-          error: 'File too large',
-          message: 'Maximum file size is 5GB'
-        });
-      }
-      
-      return res.status(500).json({
-        error: 'Upload failed',
-        message: err.message
-      });
-    }
-
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({
-        error: 'No file uploaded',
-        message: 'Please upload a video file'
-      });
-    }
-    
-    const file = req.files[0];
-    const sizeGB = (file.size / (1024 * 1024 * 1024)).toFixed(2);
-    const sizeMB = (file.size / (1024 * 1024)).toFixed(2);
-    
-    console.log('File received:', file.originalname);
-    console.log(`Size: ${sizeMB} MB (${sizeGB} GB)`);
-    console.log('Field name:', file.fieldname);
-    console.log('MIME type:', file.mimetype);
     
     // Extract user metadata from request body
-    const userMetadata = {
-      followersDocId: req.body.followersDocId || req.query.followersDocId || '',
-      userUid: req.body.userUid || req.query.userUid || '',
-      // Add any other fields you want to pass through
+    const userUid = req.body.userUid || req.query.userUid || '';
+    const followersDocId = req.body.followersDocId || req.query.followersDocId || '';
+    
+    // Log the received metadata
+    console.log('📋 Upload request received:');
+    console.log('  📱 userUid:', userUid);
+    console.log('  📄 followersDocId:', followersDocId);
+    console.log('  📁 File:', req.file.originalname);
+    
+    const metadata = {
+      'uploaded-by': req.body.userId || userUid || 'anonymous',
+      'category': req.body.category || 'general',
+      'description': req.body.description || '',
+      'userUid': userUid,
+      'followersDocId': followersDocId,
+      // Include any additional fields from request body
       ...req.body
     };
     
-    console.log('User metadata extracted:', userMetadata);
+    const result = await uploadToR2(req.file.path, req.file.filename, metadata);
     
-    const videoPath = file.path;
-    const outputFileName = `compressed_${file.filename}.mp4`;
-    const outputFilePath = path.join('uploads', outputFileName);
+    // Prepare response with all metadata
+    const responseData = {
+      success: true,
+      publicUrl: result.publicUrl,
+      mediaType: result.mediaType,
+      message: "File uploaded successfully",
+      metadata: {
+        userUid: userUid,
+        followersDocId: followersDocId,
+        fileName: result.fileName,
+        originalName: result.originalName,
+        fileSize: result.fileSize,
+        uploadDate: new Date().toISOString()
+      }
+    };
     
-    // Start compression and upload with user metadata
-    compressAndUploadVideo(videoPath, outputFilePath, res, req, file.originalname, userMetadata);
-  });
+    // Log the response
+    console.log('✅ Upload successful:');
+    console.log('  🔗 URL:', result.publicUrl);
+    console.log('  📱 userUid:', userUid);
+    console.log('  📄 followersDocId:', followersDocId);
+    
+    res.json(responseData);
+  } catch (error) {
+    if (req.file && fs.existsSync(req.file.path)) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (unlinkErr) {
+        // Silently handle cleanup errors
+      }
+    }
+    
+    let errorMessage = error.message;
+    if (error.code === 'InvalidAccessKeyId') {
+      errorMessage = "Invalid R2 Access Key ID. Please check your credentials.";
+    } else if (error.code === 'SignatureDoesNotMatch') {
+      errorMessage = "Invalid R2 Secret Access Key. Please check your credentials.";
+    } else if (error.code === 'NoSuchBucket') {
+      errorMessage = `Bucket "${ENV.R2_BUCKET_NAME}" does not exist.`;
+    } else if (error.code === 'NetworkingError') {
+      errorMessage = "Network error. Please check your R2 endpoint URL.";
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: errorMessage,
+      code: error.code || 'UNKNOWN_ERROR',
+      metadata: {
+        userUid: req.body.userUid || req.query.userUid || '',
+        followersDocId: req.body.followersDocId || req.query.followersDocId || ''
+      }
+    });
+  }
+});
+
+// Multiple files upload endpoint with user metadata
+app.post("/upload-multiple", upload.array("files", 10), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+    
+    // Extract user metadata from request body
+    const userUid = req.body.userUid || req.query.userUid || '';
+    const followersDocId = req.body.followersDocId || req.query.followersDocId || '';
+    
+    console.log('📋 Multiple upload request:');
+    console.log('  📱 userUid:', userUid);
+    console.log('  📄 followersDocId:', followersDocId);
+    console.log('  📁 Files:', req.files.length);
+    
+    const uploadPromises = req.files.map(file => 
+      uploadToR2(file.path, file.filename, {
+        'uploaded-by': req.body.userId || userUid || 'anonymous',
+        'category': req.body.category || 'general',
+        'userUid': userUid,
+        'followersDocId': followersDocId
+      })
+    );
+    
+    const results = await Promise.all(uploadPromises);
+    
+    res.json({
+      success: true,
+      message: `${results.length} files uploaded successfully`,
+      files: results.map(result => ({
+        publicUrl: result.publicUrl,
+        mediaType: result.mediaType,
+        metadata: {
+          userUid: result.userMetadata.userUid,
+          followersDocId: result.userMetadata.followersDocId
+        }
+      })),
+      metadata: {
+        userUid: userUid,
+        followersDocId: followersDocId
+      }
+    });
+  } catch (error) {
+    // Clean up remaining files
+    if (req.files) {
+      req.files.forEach(file => {
+        if (fs.existsSync(file.path)) {
+          try {
+            fs.unlinkSync(file.path);
+          } catch (unlinkErr) {
+            // Silently handle cleanup errors
+          }
+        }
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message || "Failed to upload files",
+      metadata: {
+        userUid: req.body.userUid || req.query.userUid || '',
+        followersDocId: req.body.followersDocId || req.query.followersDocId || ''
+      }
+    });
+  }
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-  const freeSpace = checkDiskSpace();
-  const uploadDir = 'uploads';
-  let fileCount = 0;
-  try {
-    fileCount = fs.readdirSync(uploadDir).length;
-  } catch (e) {}
-  
-  res.json({
-    status: 'ok',
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    diskSpace: `${freeSpace.toFixed(2)} GB free`,
-    uploadDirectory: uploadDir,
-    filesInUploadDir: fileCount,
-    maxFileSize: '5GB',
-    activeJobs: progressStore.size,
-    r2Endpoint: R2_UPLOAD_URL
-  });
-});
-
-// Cleanup old files manually
-app.post('/cleanup', (req, res) => {
-  const files = fs.readdirSync('uploads');
-  let deleted = 0;
-  
-  files.forEach(file => {
-    const filePath = path.join('uploads', file);
-    try {
-      fs.unlinkSync(filePath);
-      deleted++;
-    } catch (err) {
-      console.error('Error deleting:', filePath, err);
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "healthy", 
+    timestamp: new Date().toISOString(),
+    config: {
+      maxFileSize: ENV.MAX_FILE_SIZE / 1024 / 1024 + 'MB'
     }
-  });
-  
-  res.json({
-    success: true,
-    message: `Cleaned up ${deleted} files`,
-    totalFiles: files.length
   });
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({
-    error: 'Server error',
-    message: err.message
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'FILE_TOO_LARGE') {
+      return res.status(413).json({ 
+        error: `File too large. Maximum size is ${ENV.MAX_FILE_SIZE / 1024 / 1024}MB`,
+        metadata: {
+          userUid: req.body.userUid || req.query.userUid || '',
+          followersDocId: req.body.followersDocId || req.query.followersDocId || ''
+        }
+      });
+    }
+    return res.status(400).json({ 
+      error: err.message,
+      metadata: {
+        userUid: req.body.userUid || req.query.userUid || '',
+        followersDocId: req.body.followersDocId || req.query.followersDocId || ''
+      }
+    });
+  }
+  res.status(500).json({ 
+    error: "Internal server error",
+    metadata: {
+      userUid: req.body.userUid || req.query.userUid || '',
+      followersDocId: req.body.followersDocId || req.query.followersDocId || ''
+    }
   });
 });
 
-// ============== SERVER STARTUP ==============
-const PORT = process.env.PORT || 3000;
+const PORT = ENV.PORT || 3000;
 app.listen(PORT, () => {
   console.log('\n========================================');
   console.log('🚀 Server is running on port', PORT);
-  console.log('📁 Upload directory: uploads/');
-  console.log('📦 Max file size: 5GB');
-  console.log('💻 CPU Cores:', os.cpus().length);
-  console.log('🔄 Cleanup runs every hour');
-  console.log('📊 Progress tracking enabled');
-  console.log('☁️  R2 Upload URL:', R2_UPLOAD_URL);
+  console.log('📁 Upload directory:', uploadDir);
+  console.log('📦 Max file size:', ENV.MAX_FILE_SIZE / 1024 / 1024, 'MB');
+  console.log('☁️  R2 Bucket:', ENV.R2_BUCKET_NAME);
   console.log('========================================\n');
-  
-  // Check disk space on startup
-  checkDiskSpace();
 });
-
-// Export for testing
-module.exports = { app, progressStore, progressEmitter };
