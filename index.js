@@ -81,11 +81,12 @@ const upload = multer({
 });
 
 // Function to upload file to Cloudflare R2 with detailed logging
-const uploadToR2 = async (filePath, fileName) => {
+const uploadToR2 = async (filePath, fileName, metadata = {}) => {
   try {
     console.log('\n📤 ========== STARTING R2 UPLOAD ==========');
     console.log('📁 File path:', filePath);
     console.log('📄 File name:', fileName);
+    console.log('📋 Metadata:', metadata);
     
     // Check if file exists
     if (!fs.existsSync(filePath)) {
@@ -99,6 +100,13 @@ const uploadToR2 = async (filePath, fileName) => {
     
     const formData = new FormData();
     formData.append('file', fs.createReadStream(filePath), fileName);
+    
+    // Add metadata to the upload request
+    if (metadata) {
+      Object.keys(metadata).forEach(key => {
+        formData.append(key, metadata[key]);
+      });
+    }
     
     console.log('🌐 Sending request to:', R2_UPLOAD_URL);
     console.log('⏳ Uploading... (this may take a while for large files)');
@@ -205,11 +213,60 @@ const getVideoDuration = (inputPath) => {
   });
 };
 
+// Get video metadata including duration and media type
+const getVideoMetadata = (inputPath) => {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(inputPath, (err, metadata) => {
+      if (err) {
+        reject(err);
+      } else {
+        const duration = metadata.format.duration || 0;
+        const format = metadata.format.format_name || 'unknown';
+        const bitrate = metadata.format.bit_rate || 0;
+        const streams = metadata.streams || [];
+        
+        // Find video and audio streams
+        const videoStream = streams.find(s => s.codec_type === 'video');
+        const audioStream = streams.find(s => s.codec_type === 'audio');
+        
+        // Determine media type
+        let mediaType = 'video';
+        if (videoStream) {
+          mediaType = 'video';
+        } else if (audioStream) {
+          mediaType = 'audio';
+        } else {
+          mediaType = 'unknown';
+        }
+        
+        resolve({
+          duration: duration,
+          mediaType: mediaType,
+          format: format,
+          bitrate: bitrate,
+          videoStream: videoStream ? {
+            codec: videoStream.codec_name || 'unknown',
+            width: videoStream.width || 0,
+            height: videoStream.height || 0,
+            frameRate: videoStream.r_frame_rate || '0/0'
+          } : null,
+          audioStream: audioStream ? {
+            codec: audioStream.codec_name || 'unknown',
+            channels: audioStream.channels || 0,
+            sampleRate: audioStream.sample_rate || 0
+          } : null
+        });
+      }
+    });
+  });
+};
+
 // Enhanced compression with R2 upload
-const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalFileName) => {
+const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalFileName, userMetadata = {}) => {
   console.log('\n=== Starting Compression and Upload ===');
   console.log('Input:', inputPath);
   console.log('Output:', outputPath);
+  console.log('User Metadata:', userMetadata);
   
   // Get input file size
   let inputSize = 0;
@@ -233,25 +290,30 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
     console.warn('Could not read input file size:', error.message);
   }
 
-  // Get video duration
-  let videoDuration = 0;
+  // Get video metadata (duration and media type)
+  let videoMetadata = null;
   try {
-    videoDuration = await getVideoDuration(inputPath);
-    console.log(`Video duration: ${videoDuration.toFixed(2)} seconds`);
+    videoMetadata = await getVideoMetadata(inputPath);
+    console.log(`Video duration: ${videoMetadata.duration.toFixed(2)} seconds`);
+    console.log(`Media type: ${videoMetadata.mediaType}`);
+    console.log(`Format: ${videoMetadata.format}`);
   } catch (error) {
-    console.warn('Could not get video duration:', error.message);
+    console.warn('Could not get video metadata:', error.message);
   }
 
   // Adjust compression settings based on file size
   const isLargeFile = inputSize > 1 * 1024 * 1024 * 1024; // > 1GB
   const jobId = Date.now().toString();
   
-  // Store initial progress
+  // Store initial progress with metadata
   progressStore.set(jobId, {
     percent: 0,
     time: '00:00:00',
     status: 'processing',
-    phase: 'compression'
+    phase: 'compression',
+    duration: videoMetadata ? videoMetadata.duration : 0,
+    mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+    userMetadata: userMetadata
   });
 
   // Create a more aggressive compression for very large files
@@ -292,6 +354,7 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
     .on('progress', (progress) => {
       // Calculate progress more accurately
       let percent = 0;
+      const videoDuration = videoMetadata ? videoMetadata.duration : 0;
       if (videoDuration > 0) {
         const parts = progress.timemark.split(':').map(Number);
         const currentSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
@@ -308,7 +371,10 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
         percent: percent,
         time: currentTime,
         status: 'processing',
-        phase: 'compression'
+        phase: 'compression',
+        duration: videoMetadata ? videoMetadata.duration : 0,
+        mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+        userMetadata: userMetadata
       });
       
       // Emit progress event
@@ -322,7 +388,10 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
         percent: 100,
         time: '00:00:00',
         status: 'processing',
-        phase: 'uploading'
+        phase: 'uploading',
+        duration: videoMetadata ? videoMetadata.duration : 0,
+        mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+        userMetadata: userMetadata
       });
       
       try {
@@ -335,9 +404,20 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
         console.log(`Compressed size: ${compressedSizeMB} MB (${compressedSizeGB} GB)`);
         console.log(`Compression ratio: ${compressionRatio}% of original`);
         
-        // Upload to Cloudflare R2
+        // Prepare metadata for upload
+        const uploadMetadata = {
+          followersDocId: userMetadata.followersDocId || '',
+          userUid: userMetadata.userUid || '',
+          duration: videoMetadata ? videoMetadata.duration.toString() : '0',
+          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+          originalFileName: originalFileName,
+          compressedSize: compressedSizeMB,
+          compressionRatio: compressionRatio
+        };
+        
+        // Upload to Cloudflare R2 with metadata
         const fileName = `compressed_${Date.now()}_${path.basename(originalFileName)}`;
-        const uploadResult = await uploadToR2(outputPath, fileName);
+        const uploadResult = await uploadToR2(outputPath, fileName, uploadMetadata);
         
         // Log the full upload result
         console.log('\n📦 ========== FULL UPLOAD RESULT ==========');
@@ -357,7 +437,10 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
           percent: 100,
           time: '00:00:00',
           status: 'completed',
-          phase: 'completed'
+          phase: 'completed',
+          duration: videoMetadata ? videoMetadata.duration : 0,
+          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+          userMetadata: userMetadata
         });
         
         // Clean up local files
@@ -369,7 +452,7 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
           console.error('Error deleting local files:', err);
         }
         
-        // Send success response with R2 file info
+        // Send success response with R2 file info and all metadata
         const responseData = {
           success: true,
           message: 'Video compressed and uploaded successfully!',
@@ -383,6 +466,14 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
             status: 'success',
             fileName: fileName,
             r2Response: uploadResult
+          },
+          metadata: {
+            duration: videoMetadata ? videoMetadata.duration : 0,
+            mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+            format: videoMetadata ? videoMetadata.format : 'unknown',
+            followersDocId: userMetadata.followersDocId || '',
+            userUid: userMetadata.userUid || '',
+            originalFileName: originalFileName
           }
         };
         
@@ -399,7 +490,10 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
           percent: 0,
           time: '00:00:00',
           status: 'failed',
-          phase: 'upload_failed'
+          phase: 'upload_failed',
+          duration: videoMetadata ? videoMetadata.duration : 0,
+          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+          userMetadata: userMetadata
         });
         
         // Clean up files
@@ -413,7 +507,13 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
         res.status(500).json({
           error: 'Upload to R2 failed',
           message: error.message,
-          jobId: jobId
+          jobId: jobId,
+          metadata: {
+            duration: videoMetadata ? videoMetadata.duration : 0,
+            mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+            followersDocId: userMetadata.followersDocId || '',
+            userUid: userMetadata.userUid || ''
+          }
         });
       }
     })
@@ -425,7 +525,10 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
         percent: 0,
         time: '00:00:00',
         status: 'failed',
-        phase: 'compression_failed'
+        phase: 'compression_failed',
+        duration: videoMetadata ? videoMetadata.duration : 0,
+        mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+        userMetadata: userMetadata
       });
       
       // Clean up files
@@ -439,7 +542,13 @@ const compressAndUploadVideo = async (inputPath, outputPath, res, req, originalF
       res.status(500).json({
         error: 'Compression failed',
         message: err.message,
-        jobId: jobId
+        jobId: jobId,
+        metadata: {
+          duration: videoMetadata ? videoMetadata.duration : 0,
+          mediaType: videoMetadata ? videoMetadata.mediaType : 'unknown',
+          followersDocId: userMetadata.followersDocId || '',
+          userUid: userMetadata.userUid || ''
+        }
       });
     })
     .run();
@@ -468,6 +577,8 @@ app.get('/progress/:jobId', (req, res) => {
 // Upload endpoint with compression and R2 upload
 app.post('/upload', (req, res) => {
   console.log('\n=== New Upload Request ===');
+  console.log('Request headers:', req.headers);
+  console.log('Request body fields:', req.body);
   
   upload.any()(req, res, (err) => {
     if (err) {
@@ -502,12 +613,22 @@ app.post('/upload', (req, res) => {
     console.log('Field name:', file.fieldname);
     console.log('MIME type:', file.mimetype);
     
+    // Extract user metadata from request body
+    const userMetadata = {
+      followersDocId: req.body.followersDocId || req.query.followersDocId || '',
+      userUid: req.body.userUid || req.query.userUid || '',
+      // Add any other fields you want to pass through
+      ...req.body
+    };
+    
+    console.log('User metadata extracted:', userMetadata);
+    
     const videoPath = file.path;
     const outputFileName = `compressed_${file.filename}.mp4`;
     const outputFilePath = path.join('uploads', outputFileName);
     
-    // Start compression and upload
-    compressAndUploadVideo(videoPath, outputFilePath, res, req, file.originalname);
+    // Start compression and upload with user metadata
+    compressAndUploadVideo(videoPath, outputFilePath, res, req, file.originalname, userMetadata);
   });
 });
 
