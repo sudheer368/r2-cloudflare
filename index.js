@@ -4,6 +4,10 @@ const path = require("path");
 const fs = require("fs");
 const AWS = require("aws-sdk");
 const crypto = require("crypto");
+const { exec } = require('child_process');
+const util = require('util');
+const axios = require('axios');
+const execPromise = util.promisify(exec);
 
 const app = express();
 
@@ -15,7 +19,8 @@ const ENV = {
   R2_BUCKET_NAME: "timeline",
   R2_ACCOUNT_ID: "9074667375914ae7aa1345f9e0d9a0a5",
   PORT: 3000,
-  MAX_FILE_SIZE: 100 * 1024 * 1024 // 100MB for videos
+  MAX_FILE_SIZE: 100 * 1024 * 1024, // 100MB for videos
+  STATUS_API_URL: "https://us-central1-kiran-interior-b7e9c.cloudfunctions.net/mediafileupload/status"
 };
 
 // Clean up endpoint URL
@@ -107,12 +112,119 @@ const getMediaType = (filename) => {
   return 'other';
 };
 
+// Check if file is a video
+const isVideoFile = (filename) => {
+  const ext = path.extname(filename).toLowerCase();
+  const videoExts = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.3gp', '.ogv', '.mpeg'];
+  return videoExts.includes(ext);
+};
+
+// Get video duration using ffprobe (if available) or fallback to ffmpeg
+async function getVideoDuration(filePath) {
+  try {
+    // Try using ffprobe first (more reliable)
+    try {
+      const { stdout } = await execPromise(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`);
+      const duration = parseFloat(stdout.trim());
+      if (!isNaN(duration) && duration > 0) {
+        return duration;
+      }
+    } catch (ffprobeError) {
+      // ffprobe failed, try ffmpeg
+      console.log('ffprobe not found, trying ffmpeg...');
+    }
+    
+    // Fallback to ffmpeg
+    try {
+      const { stdout } = await execPromise(`ffmpeg -i "${filePath}" 2>&1 | grep "Duration" | awk '{print $2}' | tr -d ,`);
+      const durationStr = stdout.trim();
+      if (durationStr) {
+        // Parse duration in format HH:MM:SS.milliseconds
+        const parts = durationStr.split(':');
+        if (parts.length === 3) {
+          const hours = parseFloat(parts[0]);
+          const minutes = parseFloat(parts[1]);
+          const seconds = parseFloat(parts[2]);
+          const totalSeconds = (hours * 3600) + (minutes * 60) + seconds;
+          if (!isNaN(totalSeconds) && totalSeconds > 0) {
+            return totalSeconds;
+          }
+        }
+      }
+    } catch (ffmpegError) {
+      console.log('ffmpeg not found or failed to get duration');
+    }
+    
+    // If we can't get duration, return 0
+    return 0;
+  } catch (error) {
+    console.error('Error getting video duration:', error.message);
+    return 0;
+  }
+}
+
+// Format duration to human readable format
+const formatDuration = (seconds) => {
+  if (!seconds || seconds === 0) return '0s';
+  
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  
+  let result = '';
+  if (hours > 0) {
+    result += `${hours}h `;
+  }
+  if (minutes > 0) {
+    result += `${minutes}m `;
+  }
+  if (secs > 0 || result === '') {
+    result += `${secs}s`;
+  }
+  
+  return result.trim();
+};
+
 // Generate public URL for the file
 const getPublicUrl = (fileName) => {
   return `https://pub-${ENV.R2_ACCOUNT_ID}.r2.dev/${fileName}`;
 };
 
-// Upload function with user metadata
+// Call status API after successful upload
+async function callStatusAPI(statusData) {
+  try {
+    console.log('\n📡 ========== CALLING STATUS API ==========');
+    console.log('  🌐 URL:', ENV.STATUS_API_URL);
+    console.log('  📦 Data:', JSON.stringify(statusData, null, 2));
+    
+    const response = await axios.post(ENV.STATUS_API_URL, statusData, {
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000 // 30 seconds timeout
+    });
+    
+    console.log('✅ Status API Response:', response.status, response.statusText);
+    console.log('📦 Response Data:', JSON.stringify(response.data, null, 2));
+    console.log('==========================================\n');
+    
+    return response.data;
+  } catch (error) {
+    console.error('❌ Status API call failed:');
+    if (error.response) {
+      console.error('  Status:', error.response.status);
+      console.error('  Data:', JSON.stringify(error.response.data, null, 2));
+    } else if (error.request) {
+      console.error('  No response received from server');
+    } else {
+      console.error('  Error:', error.message);
+    }
+    console.log('==========================================\n');
+    throw error;
+  }
+}
+
+// Upload function with user metadata and video duration
 async function uploadToR2(filePath, fileName, metadata = {}) {
   try {
     if (!fs.existsSync(filePath)) {
@@ -134,6 +246,19 @@ async function uploadToR2(filePath, fileName, metadata = {}) {
     const userUid = metadata.userUid || 'anonymous';
     const followersDocId = metadata.followersDocId || 'unknown';
     
+    // Get video duration if it's a video file
+    let videoDuration = 0;
+    let formattedDuration = '0s';
+    let durationSeconds = 0;
+    
+    if (isVideoFile(fileName)) {
+      console.log('🎬 Getting video duration for:', fileName);
+      videoDuration = await getVideoDuration(filePath);
+      durationSeconds = Math.round(videoDuration); // Round to nearest second
+      formattedDuration = formatDuration(videoDuration);
+      console.log(`⏱️ Video duration: ${durationSeconds}s (${formattedDuration})`);
+    }
+    
     const params = {
       Bucket: ENV.R2_BUCKET_NAME.trim(),
       Key: uniqueKey,
@@ -147,9 +272,13 @@ async function uploadToR2(filePath, fileName, metadata = {}) {
         'file-size': fileContent.length.toString(),
         'user-uid': userUid,
         'followers-doc-id': followersDocId,
+        'video-duration-seconds': durationSeconds.toString(),
+        'video-duration-formatted': formattedDuration,
+        'caption': metadata.caption || '',
+        'visible': metadata.visible || 'followers',
         // Include all other metadata
         ...Object.keys(metadata).reduce((acc, key) => {
-          if (!['userUid', 'followersDocId'].includes(key)) {
+          if (!['userUid', 'followersDocId', 'caption', 'visible'].includes(key)) {
             acc[key] = String(metadata[key]);
           }
           return acc;
@@ -180,7 +309,13 @@ async function uploadToR2(filePath, fileName, metadata = {}) {
       fileSize: fileContent.length,
       userMetadata: {
         userUid: userUid,
-        followersDocId: followersDocId
+        followersDocId: followersDocId,
+        caption: metadata.caption || '',
+        visible: metadata.visible || 'followers'
+      },
+      videoDuration: {
+        seconds: durationSeconds,
+        formatted: formattedDuration
       }
     };
   } catch (error) {
@@ -247,12 +382,17 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // Extract user metadata from request body
     const userUid = req.body.userUid || req.query.userUid || '';
     const followersDocId = req.body.followersDocId || req.query.followersDocId || '';
+    const caption = req.body.caption || req.query.caption || '';
+    const visible = req.body.visible || req.query.visible || 'followers';
     
     // Log the received metadata
-    console.log('📋 Upload request received:');
+    console.log('\n📋 ========== UPLOAD REQUEST ==========');
     console.log('  📱 userUid:', userUid);
     console.log('  📄 followersDocId:', followersDocId);
     console.log('  📁 File:', req.file.originalname);
+    console.log('  📊 File size:', (req.file.size / 1024 / 1024).toFixed(2), 'MB');
+    console.log('  📝 Caption:', caption);
+    console.log('  👁️ Visible:', visible);
     
     const metadata = {
       'uploaded-by': req.body.userId || userUid || 'anonymous',
@@ -260,11 +400,34 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       'description': req.body.description || '',
       'userUid': userUid,
       'followersDocId': followersDocId,
+      'caption': caption,
+      'visible': visible,
       // Include any additional fields from request body
       ...req.body
     };
     
     const result = await uploadToR2(req.file.path, req.file.filename, metadata);
+    
+    // Prepare status API data
+    const statusData = {
+      useruid: userUid || '',
+      statusurl: result.publicUrl,
+      mediaType: result.mediaType,
+      visible: visible || '',
+      caption: caption || '',
+      followersdocid: followersDocId || '',
+      duration: result.videoDuration.seconds.toString(),
+      ss: 's'
+    };
+    
+    // Call status API
+    let statusApiResponse = null;
+    try {
+      statusApiResponse = await callStatusAPI(statusData);
+    } catch (error) {
+      console.error('⚠️ Status API call failed but upload was successful');
+      // Continue with response even if status API fails
+    }
     
     // Prepare response with all metadata
     const responseData = {
@@ -275,18 +438,45 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       metadata: {
         userUid: userUid,
         followersDocId: followersDocId,
+        caption: caption,
+        visible: visible,
         fileName: result.fileName,
         originalName: result.originalName,
         fileSize: result.fileSize,
+        fileSizeMB: (result.fileSize / 1024 / 1024).toFixed(2) + ' MB',
         uploadDate: new Date().toISOString()
+      },
+      statusApi: statusApiResponse ? {
+        called: true,
+        success: true,
+        response: statusApiResponse
+      } : {
+        called: false,
+        success: false,
+        message: 'Status API call failed'
       }
     };
     
+    // Add video duration if it's a video
+    if (result.videoDuration && result.videoDuration.seconds > 0) {
+      responseData.metadata.videoDuration = {
+        seconds: result.videoDuration.seconds,
+        formatted: result.videoDuration.formatted,
+        minutes: (result.videoDuration.seconds / 60).toFixed(2),
+        hours: (result.videoDuration.seconds / 3600).toFixed(2)
+      };
+    }
+    
     // Log the response
-    console.log('✅ Upload successful:');
+    console.log('✅ ========== UPLOAD SUCCESS ==========');
     console.log('  🔗 URL:', result.publicUrl);
     console.log('  📱 userUid:', userUid);
     console.log('  📄 followersDocId:', followersDocId);
+    if (result.videoDuration && result.videoDuration.seconds > 0) {
+      console.log('  ⏱️ Duration:', result.videoDuration.formatted);
+    }
+    console.log('  📡 Status API:', statusApiResponse ? '✅ Called successfully' : '❌ Failed');
+    console.log('========================================\n');
     
     res.json(responseData);
   } catch (error) {
@@ -331,37 +521,112 @@ app.post("/upload-multiple", upload.array("files", 10), async (req, res) => {
     // Extract user metadata from request body
     const userUid = req.body.userUid || req.query.userUid || '';
     const followersDocId = req.body.followersDocId || req.query.followersDocId || '';
+    const caption = req.body.caption || req.query.caption || '';
+    const visible = req.body.visible || req.query.visible || 'followers';
     
-    console.log('📋 Multiple upload request:');
+    console.log('\n📋 ========== MULTIPLE UPLOAD REQUEST ==========');
     console.log('  📱 userUid:', userUid);
     console.log('  📄 followersDocId:', followersDocId);
     console.log('  📁 Files:', req.files.length);
+    console.log('  📝 Caption:', caption);
+    console.log('  👁️ Visible:', visible);
     
     const uploadPromises = req.files.map(file => 
       uploadToR2(file.path, file.filename, {
         'uploaded-by': req.body.userId || userUid || 'anonymous',
         'category': req.body.category || 'general',
         'userUid': userUid,
-        'followersDocId': followersDocId
+        'followersDocId': followersDocId,
+        'caption': caption,
+        'visible': visible
       })
     );
     
     const results = await Promise.all(uploadPromises);
     
-    res.json({
-      success: true,
-      message: `${results.length} files uploaded successfully`,
-      files: results.map(result => ({
+    // Calculate total video duration
+    let totalDuration = 0;
+    const fileDetails = results.map(result => {
+      const fileData = {
         publicUrl: result.publicUrl,
         mediaType: result.mediaType,
         metadata: {
           userUid: result.userMetadata.userUid,
-          followersDocId: result.userMetadata.followersDocId
+          followersDocId: result.userMetadata.followersDocId,
+          caption: result.userMetadata.caption,
+          visible: result.userMetadata.visible
         }
-      })),
+      };
+      
+      if (result.videoDuration && result.videoDuration.seconds > 0) {
+        fileData.videoDuration = {
+          seconds: result.videoDuration.seconds,
+          formatted: result.videoDuration.formatted
+        };
+        totalDuration += result.videoDuration.seconds;
+      }
+      
+      return fileData;
+    });
+    
+    // Call status API for each file
+    const statusApiResults = [];
+    for (const result of results) {
+      try {
+        const statusData = {
+          useruid: userUid || 'sudheer',
+          statusurl: result.publicUrl,
+          mediaType: result.mediaType,
+          visible: visible || 'followers',
+          caption: caption || 'Good Morning',
+          followersdocid: followersDocId || 'followers123',
+          duration: result.videoDuration.seconds.toString(),
+          ss: 's'
+        };
+        
+        const statusResponse = await callStatusAPI(statusData);
+        statusApiResults.push({
+          file: result.originalName,
+          success: true,
+          response: statusResponse
+        });
+      } catch (error) {
+        statusApiResults.push({
+          file: result.originalName,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+    
+    console.log('✅ ========== UPLOAD SUCCESS ==========');
+    console.log('  📁 Files uploaded:', results.length);
+    if (totalDuration > 0) {
+      console.log('  ⏱️ Total duration:', formatDuration(totalDuration));
+    }
+    console.log('  📡 Status API calls:', statusApiResults.filter(r => r.success).length, 'successful');
+    console.log('========================================\n');
+    
+    res.json({
+      success: true,
+      message: `${results.length} files uploaded successfully`,
+      files: fileDetails,
       metadata: {
         userUid: userUid,
-        followersDocId: followersDocId
+        followersDocId: followersDocId,
+        caption: caption,
+        visible: visible,
+        totalFiles: results.length,
+        totalDuration: totalDuration > 0 ? {
+          seconds: totalDuration,
+          formatted: formatDuration(totalDuration)
+        } : undefined
+      },
+      statusApi: {
+        called: true,
+        totalCalls: statusApiResults.length,
+        successfulCalls: statusApiResults.filter(r => r.success).length,
+        results: statusApiResults
       }
     });
   } catch (error) {
@@ -395,7 +660,9 @@ app.get("/health", (req, res) => {
     status: "healthy", 
     timestamp: new Date().toISOString(),
     config: {
-      maxFileSize: ENV.MAX_FILE_SIZE / 1024 / 1024 + 'MB'
+      maxFileSize: ENV.MAX_FILE_SIZE / 1024 / 1024 + 'MB',
+      supportedFormats: ['images', 'videos', 'audio', 'PDFs'],
+      statusApiUrl: ENV.STATUS_API_URL
     }
   });
 });
@@ -436,5 +703,8 @@ app.listen(PORT, () => {
   console.log('📁 Upload directory:', uploadDir);
   console.log('📦 Max file size:', ENV.MAX_FILE_SIZE / 1024 / 1024, 'MB');
   console.log('☁️  R2 Bucket:', ENV.R2_BUCKET_NAME);
+  console.log('🎬 Video duration detection: Enabled');
+  console.log('📹 Supported video formats: MP4, MOV, AVI, MKV, WEBM, FLV, WMV, M4V, 3GP, OGV, MPEG');
+  console.log('📡 Status API URL:', ENV.STATUS_API_URL);
   console.log('========================================\n');
 });
