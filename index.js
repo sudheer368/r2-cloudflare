@@ -23,6 +23,74 @@ const ENV = {
   STATUS_API_URL: "https://us-central1-kiran-interior-b7e9c.cloudfunctions.net/mediafileupload/status"
 };
 
+// ============================================
+// 🚀 CORS CONFIGURATION - Enable Cross-Origin Access
+// ============================================
+const corsOptions = {
+  origin: '*', // For development - allow all origins
+  // For production, use specific origins:
+  // origin: ['https://yourdomain.com', 'https://app.yourdomain.com'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Accept',
+    'Origin',
+    'X-Requested-With',
+    'Access-Control-Request-Method',
+    'Access-Control-Request-Headers',
+    'X-CSRF-Token'
+  ],
+  exposedHeaders: [
+    'Content-Length',
+    'Content-Type',
+    'X-Upload-Id',
+    'X-R2-URL'
+  ],
+  credentials: true,
+  maxAge: 86400 // 24 hours
+};
+
+// CORS Middleware - Must be before all routes
+app.use((req, res, next) => {
+  // Set CORS headers for all responses
+  const origin = req.headers.origin || '*';
+  
+  // For development, allow all origins
+  // For production, validate origin here
+  res.header('Access-Control-Allow-Origin', origin);
+  res.header('Access-Control-Allow-Methods', corsOptions.methods.join(', '));
+  res.header('Access-Control-Allow-Headers', corsOptions.allowedHeaders.join(', '));
+  res.header('Access-Control-Expose-Headers', corsOptions.exposedHeaders.join(', '));
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', corsOptions.maxAge.toString());
+
+  // Handle preflight requests (OPTIONS)
+  if (req.method === 'OPTIONS') {
+    // Respond with 200 for OPTIONS requests
+    return res.status(200).json({
+      message: 'CORS preflight successful',
+      allowedOrigins: corsOptions.origin,
+      allowedMethods: corsOptions.methods,
+      allowedHeaders: corsOptions.allowedHeaders
+    });
+  }
+
+  next();
+});
+
+// Alternative: Use npm package 'cors' (uncomment if you prefer)
+/*
+const cors = require('cors');
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+  credentials: true,
+  maxAge: 86400
+}));
+*/
+
 // Clean up endpoint URL
 const endpoint = ENV.R2_ENDPOINT.replace(/\/$/, '');
 
@@ -372,7 +440,31 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
-// Single file upload endpoint with user metadata
+// ============================================
+// 📡 CORS TEST ENDPOINT
+// ============================================
+app.get("/cors-test", (req, res) => {
+  res.json({
+    success: true,
+    message: "CORS is enabled!",
+    timestamp: new Date().toISOString(),
+    headers: {
+      'Access-Control-Allow-Origin': res.getHeaders()['access-control-allow-origin'] || '*',
+      'Access-Control-Allow-Methods': res.getHeaders()['access-control-allow-methods'] || 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': res.getHeaders()['access-control-allow-headers'] || 'Content-Type, Accept'
+    },
+    environment: {
+      nodeVersion: process.version,
+      platform: process.platform,
+      endpoint: ENV.R2_ENDPOINT,
+      bucket: ENV.R2_BUCKET_NAME
+    }
+  });
+});
+
+// ============================================
+// 📤 SINGLE FILE UPLOAD ENDPOINT
+// ============================================
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
@@ -393,6 +485,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     console.log('  📊 File size:', (req.file.size / 1024 / 1024).toFixed(2), 'MB');
     console.log('  📝 Caption:', caption);
     console.log('  👁️ Visible:', visible);
+    console.log('  🌐 Origin:', req.headers.origin || 'Unknown');
     
     const metadata = {
       'uploaded-by': req.body.userId || userUid || 'anonymous',
@@ -478,6 +571,10 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     console.log('  📡 Status API:', statusApiResponse ? '✅ Called successfully' : '❌ Failed');
     console.log('========================================\n');
     
+    // Add CORS headers to response
+    res.header('X-Upload-Id', result.fileName);
+    res.header('X-R2-URL', result.publicUrl);
+    
     res.json(responseData);
   } catch (error) {
     if (req.file && fs.existsSync(req.file.path)) {
@@ -489,17 +586,23 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     }
     
     let errorMessage = error.message;
+    let statusCode = 500;
+    
     if (error.code === 'InvalidAccessKeyId') {
       errorMessage = "Invalid R2 Access Key ID. Please check your credentials.";
+      statusCode = 401;
     } else if (error.code === 'SignatureDoesNotMatch') {
       errorMessage = "Invalid R2 Secret Access Key. Please check your credentials.";
+      statusCode = 401;
     } else if (error.code === 'NoSuchBucket') {
       errorMessage = `Bucket "${ENV.R2_BUCKET_NAME}" does not exist.`;
+      statusCode = 404;
     } else if (error.code === 'NetworkingError') {
       errorMessage = "Network error. Please check your R2 endpoint URL.";
+      statusCode = 503;
     }
     
-    res.status(500).json({
+    res.status(statusCode).json({
       success: false,
       error: errorMessage,
       code: error.code || 'UNKNOWN_ERROR',
@@ -511,7 +614,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Multiple files upload endpoint with user metadata
+// ============================================
+// 📤 MULTIPLE FILES UPLOAD ENDPOINT
+// ============================================
 app.post("/upload-multiple", upload.array("files", 10), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
@@ -530,6 +635,7 @@ app.post("/upload-multiple", upload.array("files", 10), async (req, res) => {
     console.log('  📁 Files:', req.files.length);
     console.log('  📝 Caption:', caption);
     console.log('  👁️ Visible:', visible);
+    console.log('  🌐 Origin:', req.headers.origin || 'Unknown');
     
     const uploadPromises = req.files.map(file => 
       uploadToR2(file.path, file.filename, {
@@ -654,7 +760,9 @@ app.post("/upload-multiple", upload.array("files", 10), async (req, res) => {
   }
 });
 
-// Health check endpoint
+// ============================================
+// 🏥 HEALTH CHECK ENDPOINT
+// ============================================
 app.get("/health", (req, res) => {
   res.json({ 
     status: "healthy", 
@@ -663,11 +771,19 @@ app.get("/health", (req, res) => {
       maxFileSize: ENV.MAX_FILE_SIZE / 1024 / 1024 + 'MB',
       supportedFormats: ['images', 'videos', 'audio', 'PDFs'],
       statusApiUrl: ENV.STATUS_API_URL
+    },
+    cors: {
+      enabled: true,
+      allowedOrigins: corsOptions.origin,
+      allowedMethods: corsOptions.methods,
+      allowedHeaders: corsOptions.allowedHeaders
     }
   });
 });
 
-// Error handling middleware
+// ============================================
+// ❌ ERROR HANDLING MIDDLEWARE
+// ============================================
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'FILE_TOO_LARGE') {
@@ -696,6 +812,9 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ============================================
+// 🚀 START SERVER
+// ============================================
 const PORT = ENV.PORT || 3000;
 app.listen(PORT, () => {
   console.log('\n========================================');
@@ -706,5 +825,11 @@ app.listen(PORT, () => {
   console.log('🎬 Video duration detection: Enabled');
   console.log('📹 Supported video formats: MP4, MOV, AVI, MKV, WEBM, FLV, WMV, M4V, 3GP, OGV, MPEG');
   console.log('📡 Status API URL:', ENV.STATUS_API_URL);
+  console.log('\n🌐 CORS Configuration:');
+  console.log('  ✅ Allowed Origins:', corsOptions.origin);
+  console.log('  ✅ Allowed Methods:', corsOptions.methods.join(', '));
+  console.log('  ✅ Allowed Headers:', corsOptions.allowedHeaders.join(', '));
+  console.log('  ✅ Max Age:', corsOptions.maxAge, 'seconds');
+  console.log('\n📡 Test CORS: GET /cors-test');
   console.log('========================================\n');
 });
